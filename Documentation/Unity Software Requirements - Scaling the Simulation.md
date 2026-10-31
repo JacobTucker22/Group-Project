@@ -12,23 +12,23 @@
 | **Course Instructor** | Prof. Anwar Ghammam |
 | **Development Team** | Jacob A. Tucker, Abhinav Suresh, Angela Allen, Giovanna Ponce Cisternas |
 | **Target Engine** | Unity 6 / Unity 2022.3 LTS (C\# .NET Standard 2.1) |
-| **Target Frame Target** | 60 FPS (Strict 16.67ms Frame Budget) |
-| **Stress Test Capacity** | 1,000 to 20,000+ Concurrent Entities |
+| **Target Frame Target** | 60 FPS (Aspirational project target) |
+| **Stress Test Capacity** | Multiple increasing concurrent entity tiers |
 
 ---
 
 # **1\. System Overview & Objectives**
 
-Real-time interactive systems operating within synchronous frame loops must reconcile strict runtime performance constraints with software maintainability and modularity. In soft real-time environments such as game engines, maintaining a target rate of 60 frames per second allows a total frame budget of approximately 16.67 milliseconds per frame. Architectural decisions directly dictate whether an application can process thousands of entity updates without inducing CPU starvation, cache misses, or garbage collection (GC) allocation pauses.
+Real-time interactive systems operating within synchronous frame loops must reconcile runtime performance constraints with software maintainability and modularity. Architectural decisions directly dictate whether an application can process thousands of entity updates without inducing CPU starvation, cache misses, or garbage collection (GC) allocation pauses.
 
-The objective of this software system is to establish a rigorous, interactive 3D simulation benchmark in Unity. The project systematically evaluates four distinct architectural design paradigms under scaling entity loads:
+The objective of this software system is to establish an interactive 3D simulation benchmark proof of concept in Unity. The project evaluates four distinct architectural design paradigms under scaling entity loads:
 
 * **Naive Baseline (Dynamic Instantiation):** Traditional dynamic allocation and destruction on heap per entity lifecycle.  
 * **Flyweight Pattern:** Classical structural decoupling of intrinsic static state from extrinsic runtime state.  
 * **Object Pool Pattern:** Domain-specific memory pre-allocation and recycling array structures.  
 * **Data Locality / Component Arrays:** Data-Oriented Design (DOD) utilizing contiguous struct arrays for optimal CPU cache utilization.
 
-The system must allow seamless switching between these four execution models at runtime, record execution metrics (CPU frame time, garbage collection churn, and frame rates), render telemetry graphs, and export structured benchmark datasets for comparative architectural analysis.
+The system must allow switching between these four execution models at runtime, record execution metrics (CPU frame time and frame rates), provide an on-screen telemetry summary, and export benchmark datasets for comparative architectural analysis.
 
 ---
 
@@ -36,31 +36,31 @@ The system must allow seamless switching between these four execution models at 
 
 ## **FR-1: Entity Simulation & Spawning Engine**
 
-* **FR-1.1 Load Scaling:** The simulation engine shall dynamically spawn, update, and destroy interactive 3D simulation entities scaling from 1,000 to 20,000+ units in real time.  
+* **FR-1.1 Load Scaling:** The simulation engine shall dynamically spawn, update, and destroy interactive 3D simulation entities across increasing preset tiers in real time.  
 * **FR-1.2 Simulation Logic:** Each entity shall perform identical per-frame physics transformation logic, rotation updating, boundary checking, and spatial vector manipulation during each frame tick.  
-* **FR-1.3 Parameter Adjustment:** The system shall allow the user to adjust total entity count, spawn rates, and movement velocity via an on-screen runtime control panel.
+* **FR-1.3 Parameter Adjustment:** The system shall allow the user to adjust total entity count via an on-screen runtime control panel.
 
 ## **FR-2: Architectural Paradigm Switching**
 
 * **FR-2.1 Paradigm Isolation:** The system shall isolate each of the four software architecture patterns into independent execution modules implementing a common architectural interface.  
-* **FR-2.2 Runtime Toggling:** The system shall support hot-swapping between active architectural implementations at runtime without requiring application restarts.  
-* **FR-2.3 State Sanitization:** Switching paradigms shall trigger a complete cleanup of active heap objects, memory buffers, and telemetry accumulators to prevent cross-paradigm contamination.
+* **FR-2.2 Runtime Toggling:** The system shall support switching between active architectural implementations at runtime without requiring application restarts.  
+* **FR-2.3 State Reset:** Switching paradigms shall trigger cleanup of active objects and telemetry counters before the next pattern starts.
 
 ## **FR-3: Telemetry & Benchmarking Harness**
 
-* **FR-3.1 Execution Measurement:** The telemetry engine shall measure CPU frame duration delta (\$\\Delta t\$), frame rate (FPS), allocated Managed Memory (GC Heap in Bytes), and Garbage Collection collection counts per frame.  
-* **FR-3.2 Automated Benchmark Sweeper:** The system shall include an automated stress-testing mode that executes fixed duration test runs (e.g., 10 seconds per step) across escalating entity tiers (1,000; 2,500; 5,000; 10,000; 15,000; 20,000 units).  
-* **FR-3.3 Marker Instrumentation:** The system shall integrate `UnityEngine.Profiling.ProfilerMarker` calls across entity update loops to facilitate deep profiling in Unity Profiler and Frame Debugger.
+* **FR-3.1 Execution Measurement:** The telemetry engine shall measure frame duration and frame rate (FPS) throughout each run.  
+* **FR-3.2 Automated Benchmark Sweeper:** The system shall include an automated stress-testing mode that executes fixed-duration test runs across escalating entity tiers selected for the implementation phase.  
+* **FR-3.3 Run Summary:** The system shall compute summary statistics per run for frame-rate and frame-time behavior.
 
 ## **FR-4: UI Telemetry HUD & Visual Overlay**
 
-* **FR-4.1 Real-Time Display:** The screen overlay shall present numerical readout of current FPS, average frame time (\$ms\$), dynamic entity count, and active architectural pattern.  
-* **FR-4.2 Graphical Performance Charting:** The HUD shall display real-time line charts tracking CPU frame times against the 16.67ms performance threshold line.
+* **FR-4.1 Real-Time Display:** The screen overlay shall present numerical readout of current FPS, average frame time (\$ms\$), entity count, and active architectural pattern.  
+* **FR-4.2 Interactive Controls:** The runtime UI shall provide controls for pattern switching, run/stop, and entity-count preset selection.
 
 ## **FR-5: Dataset Export Logger**
 
-* **FR-5.1 CSV/JSON Output:** The system shall serialize recorded benchmark data into structured `.csv` or `.json` files saved locally to `Application.persistentDataPath`.  
-* **FR-5.2 File Format Standard:** Exported records must capture: `Timestamp`, `PatternID`, `EntityCount`, `AverageFrameTimeMS`, `MinFrameTimeMS`, `MaxFrameTimeMS`, `GCAllocatedBytes`, and `FrameBudgetExceededCount`.
+* **FR-5.1 CSV Output:** The system shall serialize recorded benchmark data into structured `.csv` files saved locally to `Application.persistentDataPath`.  
+* **FR-5.2 File Format Standard:** Exported records must capture pattern identifier, entity-count tier, and run-summary metrics.
 
 ---
 
@@ -68,11 +68,11 @@ The system must allow seamless switching between these four execution models at 
 
 | Requirement Category | Metric / Specification | Target Threshold | Validation Method |
 | :---- | :---- | :---- | :---- |
-| **Performance Target** | Frame Execution Time Budget | \$\\le 16.67\\text{ ms}\$ per frame (60 FPS) | Built-in Telemetry Harness |
-| **Memory Allocation** | Runtime GC Allocation (Pool / Data Locality) | 0 Bytes per frame during update loops | Unity Profiler (`GC.Alloc`) |
-| **Scalability** | Peak Entity Capacity under active simulation | Minimum 10,000 units sustained at \$\\ge 30\\text{ FPS}\$ | Automated Benchmark Sweeper |
-| **Modularity & Coupling** | Class Coupling & Interface Abstraction | Low coupling; pattern modules extend `ISimulationArchitecture` | Static Code Analysis / Audit |
-| **Determinism** | Test Reproducibility | Identical entity seed state across paradigm runs | Seeded pseudo-random generation |
+| **Performance Target** | Frame Execution Time Budget | Maintain interactive performance and report observed results by tier | Built-in Telemetry Harness |
+| **Memory Allocation** | Runtime GC Allocation (Pool / Data Locality) | Lower than Naive baseline under equivalent load | Unity Profiler and runtime metrics |
+| **Scalability** | Peak Entity Capacity under active simulation | Demonstrate comparative behavior across increasing tiers | Automated Benchmark Sweeper |
+| **Modularity & Coupling** | Interface-based Pattern Isolation | Pattern modules implement `ISimulationArchitecture` | Code review |
+| **Repeatability** | Comparable run setup | Same presets and run durations across patterns | Benchmark run script |
 
 ---
 
@@ -140,35 +140,35 @@ The system must allow seamless switching between these four execution models at 
   * Uses C\# `struct` definitions stored in contiguous array layouts (e.g., `NativeArray<Vector3>` for positions, `NativeArray<Vector3>` for velocities).  
   * Update logic operates via a single centralized system loop iterating linearly over contiguous memory buffers.  
   * Optional acceleration via Unity C\# Job System and SIMD auto-vectorization (`IJobParallelFor`).  
-* **Expected Impact:** High L1/L2 CPU cache utilization, minimal cache misses, execution speed scaling efficiently to tens of thousands of entities per frame within the 16.67ms budget.
+* **Expected Impact:** High L1/L2 CPU cache utilization, minimal cache misses, and improved execution scaling at higher entity counts.
 
 ---
 
 # **5\. Target Performance Constraints & Telemetry System**
 
-## **5.1 Performance Constraint Budget**
+## **5.1 Performance Budget (Project Target)**
 
-Total Frame Budget: 16.67 ms (60 FPS)
-
-\+--------------------------------------------------------+-------------------+
-
-\| Simulation Update & Pattern Logic Execution            \| Target: \< 10.0 ms \|
+Frame Budget Reference: To be finalized during implementation and early profiling.
 
 \+--------------------------------------------------------+-------------------+
 
-\| Telemetry & Metric Sampling Overhead                   \| Target: \<  0.5 ms \|
+\| Simulation Update & Pattern Logic Execution            \| Target: as low as practical for comparison \|
 
 \+--------------------------------------------------------+-------------------+
 
-\| Rendering, UI Overlay & Engine Overhead                \| Target: \<  6.17ms \|
+\| Telemetry & Metric Sampling Overhead                   \| Target: minimal overhead \|
+
+\+--------------------------------------------------------+-------------------+
+
+\| Rendering, UI Overlay & Engine Overhead                \| Target: stable enough for interactive comparison \|
 
 \+--------------------------------------------------------+-------------------+
 
 ## **5.2 Telemetry Instrumentation Architecture**
 
-* **Frame Timing Provider:** Uses `FrameTimingManager` and `Time.unscaledDeltaTime` to compute smoothed rolling averages over 60-frame windows.  
-* **Memory Tracking Provider:** Interrogates `UnityEngine.Profiling.Profiler.GetMonoUsedSizeLong()` and `GC.GetTotalMemory(false)` at the start and end of every update cycle.  
-* **Profiler Markers:** Custom code blocks are wrapped using native Profiler Markers:static readonly ProfilerMarker s\_SimulationUpdateMarker \= new ProfilerMarker("Simulation.UpdateEntities");
+* **Frame Timing Provider:** Uses `Time.unscaledDeltaTime` for rolling frame-time and FPS summaries.  
+* **Benchmark Summary Provider:** Aggregates run-summary metrics for frame-rate and frame-time behavior.  
+* **Optional Deep Profiling:** Additional profiler markers may be added for detailed investigation when needed.
 
 ---
 
@@ -345,8 +345,8 @@ Requirements:
 
 1. **Functional Verification:** The simulation allows real-time switching between all four patterns without crashing or dropping frames due to memory leaks.  
 2. **Telemetry Validation:** The HUD displays real-time frame time metrics accurately matching Unity Profiler telemetry.  
-3. **Data Logging Integrity:** Executing an automated benchmark run produces a valid `.csv` file containing metrics across entity loads up to 20,000 units.  
-4. **Target Benchmark:** The Data Locality pattern demonstrates statistically significant performance gains over the Naive Baseline at 10,000+ entity scales.
+3. **Data Logging Integrity:** Executing an automated benchmark run produces a valid `.csv` file containing metrics across configured entity tiers.  
+4. **Target Benchmark:** The benchmark results show clear measurable differences between patterns at higher entity scales.
 
 ## **8.2 Document Approval Sign-Off**
 
