@@ -2,7 +2,7 @@ using UnityEngine;
 
 public class NaiveEntityController : MonoBehaviour
 {
-    private NaiveSimulationManager manager;
+    private ISimulationRuntimeContext runtimeContext;
     private Vector3 velocity;
     private Vector3 rotationAxis;
     private float rotationSpeed;
@@ -10,12 +10,12 @@ public class NaiveEntityController : MonoBehaviour
     private bool isInitialized;
 
     public void Initialize(
-        NaiveSimulationManager simulationManager,
+        ISimulationRuntimeContext simulationContext,
         Vector3 initialVelocity,
         Vector3 initialRotationAxis,
         float initialRotationSpeed)
     {
-        manager = simulationManager;
+        runtimeContext = simulationContext;
         velocity = initialVelocity;
         rotationAxis = initialRotationAxis.sqrMagnitude < 0.0001f ? Vector3.up : initialRotationAxis.normalized;
         rotationSpeed = initialRotationSpeed;
@@ -24,7 +24,7 @@ public class NaiveEntityController : MonoBehaviour
 
     private void Update()
     {
-        if (!isInitialized || manager == null || !manager.IsRunning)
+        if (!isInitialized || runtimeContext == null || !runtimeContext.IsSimulationRunning)
         {
             return;
         }
@@ -38,8 +38,8 @@ public class NaiveEntityController : MonoBehaviour
 
     private void ApplyBoundsBounce()
     {
-        Vector3 center = manager.transform.position;
-        Vector3 extents = manager.BoundsHalfExtents;
+        Vector3 center = runtimeContext.SimulationCenter;
+        Vector3 extents = runtimeContext.SimulationBoundsHalfExtents;
         Vector3 local = transform.position - center;
 
         bool flippedX = false;

@@ -4,12 +4,61 @@ using UnityEngine;
 using UnityEngine.InputSystem;
 #endif
 
-public class NaiveSimulationManager : MonoBehaviour
+public interface ISimulationArchitecture
 {
+    string Name { get; }
+    bool IsInitialized { get; }
+    int ActiveEntityCount { get; }
+
+    void Initialize();
+    void UpdateSimulation(float deltaTime);
+    void SetEntityCount(int count);
+    void Cleanup();
+}
+
+public interface ISimulationRuntimeContext
+{
+    bool IsSimulationRunning { get; }
+    Vector3 SimulationCenter { get; }
+    Vector3 SimulationBoundsHalfExtents { get; }
+}
+
+public class NaiveSimulationManager : MonoBehaviour, ISimulationRuntimeContext
+{
+    private enum SimulationPattern
+    {
+        Naive,
+        ObjectPool
+    }
+
+    private enum CyclePhase
+    {
+        Idle,
+        RampUp,
+        Hold,
+        RampDown
+    }
+
+    private struct FrameTimeSample
+    {
+        public float Time;
+        public float FrameTimeMs;
+
+        public FrameTimeSample(float time, float frameTimeMs)
+        {
+            Time = time;
+            FrameTimeMs = frameTimeMs;
+        }
+    }
+
     [Header("Naive Pattern")]
     [SerializeField] private string activePatternLabel = "Naive";
     [SerializeField] private GameObject entityPrefab;
     [SerializeField] private Transform entityParent;
+
+    [Header("Architecture")]
+    [SerializeField] private SimulationPattern initialPattern = SimulationPattern.Naive;
+    [SerializeField] private bool prewarmObjectPool = true;
 
     [Header("Simulation")]
     [SerializeField] private bool autoStart = true;
@@ -21,17 +70,124 @@ public class NaiveSimulationManager : MonoBehaviour
     [SerializeField] private float minRotationSpeed = 30f;
     [SerializeField] private float maxRotationSpeed = 90f;
 
+    [Header("Cycle Stress Mode")]
+    [SerializeField] private bool enableAutoCycleMode;
+    [SerializeField] private float spawnRatePerSecond = 450f;
+    [SerializeField] private float despawnRatePerSecond = 450f;
+    [SerializeField] private float holdAtCapSeconds = 2f;
+    [SerializeField] private bool loopCycle = true;
+    [SerializeField] private bool resetToZeroOnStop = true;
+
     [Header("Debug UI")]
     [SerializeField] private bool showRuntimeOverlay = true;
+    [SerializeField] private float spikeWindowSeconds = 5f;
 
-    private readonly List<NaiveEntityController> entities = new List<NaiveEntityController>();
     private bool isRunning;
+    private ISimulationArchitecture activeArchitecture;
+    private SimulationPattern activePattern;
+    private CyclePhase cyclePhase = CyclePhase.Idle;
+    private float cyclePhaseElapsedSeconds;
+    private int cycleTargetCount;
+    private int cycleCountAtPhaseStart;
+    private int lastAppliedCount;
 
     private float fpsSmoothed;
     private float frameTimeMsSmoothed;
 
+    private int currentWindowSpawnOps;
+    private int currentWindowDespawnOps;
+    private float currentWindowElapsed;
+    private float spawnOpsPerSecond;
+    private float despawnOpsPerSecond;
+
+    private long instantiateCount;
+    private long destroyCount;
+    private long poolActivateCount;
+    private long poolDeactivateCount;
+    private long poolReuseActivateCount;
+    private long poolFreshActivateCount;
+
+    private int gc0Baseline;
+    private int gc1Baseline;
+    private int gc2Baseline;
+    private int gc0Delta;
+    private int gc1Delta;
+    private int gc2Delta;
+    private float managedMemoryMb;
+
+    private float spikeFrameTimeMs;
+    private readonly Queue<FrameTimeSample> recentFrameTimes = new Queue<FrameTimeSample>();
+
     public bool IsRunning => isRunning;
     public Vector3 BoundsHalfExtents => boundsHalfExtents;
+    public bool IsSimulationRunning => isRunning;
+    public Vector3 SimulationCenter => transform.position;
+    public Vector3 SimulationBoundsHalfExtents => boundsHalfExtents;
+
+    public void RecordInstantiate()
+    {
+        if (!isRunning)
+        {
+            return;
+        }
+
+        instantiateCount++;
+        currentWindowSpawnOps++;
+    }
+
+    public void RecordDestroy()
+    {
+        if (!isRunning)
+        {
+            return;
+        }
+
+        destroyCount++;
+        currentWindowDespawnOps++;
+    }
+
+    public void RecordPoolActivate(bool reused)
+    {
+        if (!isRunning)
+        {
+            return;
+        }
+
+        poolActivateCount++;
+        currentWindowSpawnOps++;
+
+        if (reused)
+        {
+            poolReuseActivateCount++;
+            return;
+        }
+
+        poolFreshActivateCount++;
+    }
+
+    public void RecordPoolDeactivate()
+    {
+        if (!isRunning)
+        {
+            return;
+        }
+
+        poolDeactivateCount++;
+        currentWindowDespawnOps++;
+    }
+
+    private void Awake()
+    {
+        if (entityPrefab == null)
+        {
+            return;
+        }
+
+        activePattern = initialPattern;
+        activeArchitecture = CreateArchitecture(activePattern);
+        SyncActivePatternLabel();
+        ResetMetricsTracking();
+    }
 
     private void Start()
     {
@@ -46,17 +202,60 @@ public class NaiveSimulationManager : MonoBehaviour
     {
         UpdatePerformanceStats();
         HandleKeyboardShortcuts();
+
+        if (!enableAutoCycleMode && cyclePhase != CyclePhase.Idle)
+        {
+            ResetCycleState();
+            if (isRunning)
+            {
+                SetEntityCount(GetSelectedPresetCount());
+            }
+        }
+
+        if (activeArchitecture != null && isRunning)
+        {
+            if (enableAutoCycleMode)
+            {
+                UpdateCycleMode(Time.deltaTime);
+            }
+
+            activeArchitecture.UpdateSimulation(Time.deltaTime);
+        }
     }
 
     public void StartSimulation()
     {
+        if (!TryValidatePresetData())
+        {
+            return;
+        }
+
+        if (!activeArchitecture.IsInitialized)
+        {
+            activeArchitecture.Initialize();
+        }
+
+        ResetMetricsTracking();
         isRunning = true;
+        if (enableAutoCycleMode)
+        {
+            RestartCycleFromZero();
+            return;
+        }
+
         ApplySelectedPreset();
     }
 
     public void StopSimulation()
     {
         isRunning = false;
+        ResetCycleState();
+
+        if (resetToZeroOnStop)
+        {
+            SetEntityCount(0);
+            lastAppliedCount = 0;
+        }
     }
 
     public void ToggleSimulation()
@@ -70,6 +269,21 @@ public class NaiveSimulationManager : MonoBehaviour
         StartSimulation();
     }
 
+    public void NextPattern()
+    {
+        SetPattern(activePattern == SimulationPattern.Naive ? SimulationPattern.ObjectPool : SimulationPattern.Naive);
+    }
+
+    public void SetPatternNaive()
+    {
+        SetPattern(SimulationPattern.Naive);
+    }
+
+    public void SetPatternObjectPool()
+    {
+        SetPattern(SimulationPattern.ObjectPool);
+    }
+
     public void ApplySelectedPreset()
     {
         if (!TryValidatePresetData())
@@ -77,7 +291,15 @@ public class NaiveSimulationManager : MonoBehaviour
             return;
         }
 
-        SetEntityCount(entityCountPresets[selectedPresetIndex]);
+        if (isRunning && enableAutoCycleMode)
+        {
+            RestartCycleFromZero();
+            return;
+        }
+
+        int targetCount = GetSelectedPresetCount();
+        SetEntityCount(targetCount);
+        lastAppliedCount = targetCount;
     }
 
     public void SetPresetIndex(int index)
@@ -119,17 +341,14 @@ public class NaiveSimulationManager : MonoBehaviour
 
     public void SetEntityCount(int count)
     {
-        count = Mathf.Max(0, count);
-
-        while (entities.Count < count)
+        if (activeArchitecture == null)
         {
-            SpawnEntity();
+            return;
         }
 
-        while (entities.Count > count)
-        {
-            DespawnLastEntity();
-        }
+        int clampedCount = Mathf.Max(0, count);
+        activeArchitecture.SetEntityCount(clampedCount);
+        lastAppliedCount = clampedCount;
     }
 
     private bool TryValidatePresetData()
@@ -146,59 +365,277 @@ public class NaiveSimulationManager : MonoBehaviour
             return false;
         }
 
+        if (activeArchitecture == null)
+        {
+            activeArchitecture = CreateArchitecture(activePattern);
+            SyncActivePatternLabel();
+        }
+
         return true;
     }
 
-    private void SpawnEntity()
+    private ISimulationArchitecture CreateArchitecture(SimulationPattern pattern)
     {
-        GameObject instance = Instantiate(entityPrefab, RandomSpawnPosition(), Quaternion.identity, entityParent);
-
-        NaiveEntityController controller = instance.GetComponent<NaiveEntityController>();
-        if (controller == null)
+        switch (pattern)
         {
-            controller = instance.AddComponent<NaiveEntityController>();
+            case SimulationPattern.ObjectPool:
+                return new ObjectPoolSimulationArchitecture(
+                    this,
+                    entityPrefab,
+                    entityParent,
+                    minSpeed,
+                    maxSpeed,
+                    minRotationSpeed,
+                    maxRotationSpeed,
+                    GetPoolPrewarmCount(),
+                    prewarmObjectPool,
+                    RecordInstantiate,
+                    RecordPoolActivate,
+                    RecordPoolDeactivate,
+                    RecordDestroy);
+
+            case SimulationPattern.Naive:
+            default:
+                return new NaiveSimulationArchitecture(
+                    this,
+                    entityPrefab,
+                    entityParent,
+                    minSpeed,
+                    maxSpeed,
+                    minRotationSpeed,
+                    maxRotationSpeed,
+                    RecordInstantiate,
+                    RecordDestroy);
         }
-
-        Vector3 velocity = RandomVelocity();
-        Vector3 rotationAxis = Random.onUnitSphere;
-        float rotationSpeed = Random.Range(minRotationSpeed, maxRotationSpeed);
-
-        controller.Initialize(this, velocity, rotationAxis, rotationSpeed);
-        entities.Add(controller);
     }
 
-    private void DespawnLastEntity()
+    private void SetPattern(SimulationPattern targetPattern)
     {
-        int lastIndex = entities.Count - 1;
-        NaiveEntityController entity = entities[lastIndex];
-        entities.RemoveAt(lastIndex);
-
-        if (entity != null)
+        if (activePattern == targetPattern || entityPrefab == null)
         {
-            Destroy(entity.gameObject);
+            return;
+        }
+
+        int currentCount = activeArchitecture == null ? 0 : activeArchitecture.ActiveEntityCount;
+        bool wasRunning = isRunning;
+        bool cycleWasActive = enableAutoCycleMode && cyclePhase != CyclePhase.Idle;
+
+        if (activeArchitecture != null)
+        {
+            activeArchitecture.Cleanup();
+        }
+
+        activePattern = targetPattern;
+        activeArchitecture = CreateArchitecture(activePattern);
+        SyncActivePatternLabel();
+
+        if (wasRunning)
+        {
+            activeArchitecture.Initialize();
+            activeArchitecture.SetEntityCount(currentCount);
+            lastAppliedCount = currentCount;
+
+            if (cycleWasActive)
+            {
+                cycleCountAtPhaseStart = currentCount;
+            }
         }
     }
 
-    private Vector3 RandomSpawnPosition()
+    public void ToggleCycleMode()
     {
-        return transform.position + new Vector3(
-            Random.Range(-boundsHalfExtents.x, boundsHalfExtents.x),
-            Random.Range(-boundsHalfExtents.y, boundsHalfExtents.y),
-            Random.Range(-boundsHalfExtents.z, boundsHalfExtents.z));
-    }
+        enableAutoCycleMode = !enableAutoCycleMode;
 
-    private Vector3 RandomVelocity()
-    {
-        Vector3 direction = Random.onUnitSphere;
-        direction.y *= 0.35f;
-        if (direction.sqrMagnitude < 0.001f)
+        if (!isRunning)
         {
-            direction = Vector3.forward;
+            ResetCycleState();
+            return;
         }
 
-        direction.Normalize();
-        float speed = Random.Range(minSpeed, maxSpeed);
-        return direction * speed;
+        if (enableAutoCycleMode)
+        {
+            RestartCycleFromZero();
+            return;
+        }
+
+        ResetCycleState();
+        SetEntityCount(GetSelectedPresetCount());
+    }
+
+    private void RestartCycleFromZero()
+    {
+        int targetCount = GetSelectedPresetCount();
+        cycleTargetCount = Mathf.Max(0, targetCount);
+
+        if (cycleTargetCount <= 0)
+        {
+            Debug.LogWarning("Selected preset count is zero. Cycle mode requires a positive preset.");
+            ResetCycleState();
+            SetEntityCount(0);
+            return;
+        }
+
+        SetEntityCount(0);
+        cycleCountAtPhaseStart = 0;
+        cyclePhaseElapsedSeconds = 0f;
+        cyclePhase = CyclePhase.RampUp;
+    }
+
+    private void ResetCycleState()
+    {
+        cyclePhase = CyclePhase.Idle;
+        cyclePhaseElapsedSeconds = 0f;
+        cycleTargetCount = 0;
+        cycleCountAtPhaseStart = lastAppliedCount;
+    }
+
+    private void UpdateCycleMode(float deltaTime)
+    {
+        if (cyclePhase == CyclePhase.Idle)
+        {
+            return;
+        }
+
+        cyclePhaseElapsedSeconds += Mathf.Max(0f, deltaTime);
+
+        switch (cyclePhase)
+        {
+            case CyclePhase.RampUp:
+                UpdateRampUpPhase();
+                break;
+
+            case CyclePhase.Hold:
+                UpdateHoldPhase();
+                break;
+
+            case CyclePhase.RampDown:
+                UpdateRampDownPhase();
+                break;
+        }
+    }
+
+    private void UpdateRampUpPhase()
+    {
+        float safeRate = Mathf.Max(1f, spawnRatePerSecond);
+        int grownCount = cycleCountAtPhaseStart + Mathf.FloorToInt(cyclePhaseElapsedSeconds * safeRate);
+        int targetCount = Mathf.Min(cycleTargetCount, grownCount);
+        ApplyEntityCountIfChanged(targetCount);
+
+        if (targetCount < cycleTargetCount)
+        {
+            return;
+        }
+
+        if (holdAtCapSeconds <= 0f)
+        {
+            TransitionCyclePhase(CyclePhase.RampDown);
+            return;
+        }
+
+        TransitionCyclePhase(CyclePhase.Hold);
+    }
+
+    private void UpdateHoldPhase()
+    {
+        ApplyEntityCountIfChanged(cycleTargetCount);
+
+        if (cyclePhaseElapsedSeconds >= holdAtCapSeconds)
+        {
+            TransitionCyclePhase(CyclePhase.RampDown);
+        }
+    }
+
+    private void UpdateRampDownPhase()
+    {
+        float safeRate = Mathf.Max(1f, despawnRatePerSecond);
+        int reducedCount = cycleCountAtPhaseStart - Mathf.FloorToInt(cyclePhaseElapsedSeconds * safeRate);
+        int targetCount = Mathf.Max(0, reducedCount);
+        ApplyEntityCountIfChanged(targetCount);
+
+        if (targetCount > 0)
+        {
+            return;
+        }
+
+        if (!loopCycle)
+        {
+            ResetCycleState();
+            return;
+        }
+
+        TransitionCyclePhase(CyclePhase.RampUp);
+    }
+
+    private void TransitionCyclePhase(CyclePhase nextPhase)
+    {
+        cyclePhase = nextPhase;
+        cyclePhaseElapsedSeconds = 0f;
+        cycleCountAtPhaseStart = lastAppliedCount;
+    }
+
+    private void ApplyEntityCountIfChanged(int targetCount)
+    {
+        int clampedTarget = Mathf.Max(0, targetCount);
+        if (clampedTarget == lastAppliedCount)
+        {
+            return;
+        }
+
+        SetEntityCount(clampedTarget);
+    }
+
+    private int GetSelectedPresetCount()
+    {
+        if (entityCountPresets == null || entityCountPresets.Length == 0)
+        {
+            return 0;
+        }
+
+        return entityCountPresets[Mathf.Clamp(selectedPresetIndex, 0, entityCountPresets.Length - 1)];
+    }
+
+    private string CyclePhaseDisplay()
+    {
+        if (!enableAutoCycleMode)
+        {
+            return "Off";
+        }
+
+        return cyclePhase.ToString();
+    }
+
+    private float HoldTimeRemainingSeconds()
+    {
+        if (cyclePhase != CyclePhase.Hold)
+        {
+            return 0f;
+        }
+
+        return Mathf.Max(0f, holdAtCapSeconds - cyclePhaseElapsedSeconds);
+    }
+
+    private void SyncActivePatternLabel()
+    {
+        activePatternLabel = activeArchitecture == null ? activePattern.ToString() : activeArchitecture.Name;
+    }
+
+    private int GetPoolPrewarmCount()
+    {
+        if (entityCountPresets == null || entityCountPresets.Length == 0)
+        {
+            return 0;
+        }
+
+        int maxCount = 0;
+        for (int i = 0; i < entityCountPresets.Length; i++)
+        {
+            if (entityCountPresets[i] > maxCount)
+            {
+                maxCount = entityCountPresets[i];
+            }
+        }
+
+        return maxCount;
     }
 
     private void UpdatePerformanceStats()
@@ -209,6 +646,95 @@ public class NaiveSimulationManager : MonoBehaviour
 
         fpsSmoothed = Mathf.Lerp(fpsSmoothed <= 0f ? fps : fpsSmoothed, fps, 0.15f);
         frameTimeMsSmoothed = Mathf.Lerp(frameTimeMsSmoothed <= 0f ? frameTimeMs : frameTimeMsSmoothed, frameTimeMs, 0.15f);
+
+        UpdateOperationRates(dt);
+        UpdateFrameSpikeWindow(frameTimeMs);
+        UpdateGcMetrics();
+    }
+
+    private void UpdateOperationRates(float unscaledDeltaTime)
+    {
+        currentWindowElapsed += unscaledDeltaTime;
+        if (currentWindowElapsed < 1f)
+        {
+            return;
+        }
+
+        float windowDuration = Mathf.Max(0.001f, currentWindowElapsed);
+        spawnOpsPerSecond = currentWindowSpawnOps / windowDuration;
+        despawnOpsPerSecond = currentWindowDespawnOps / windowDuration;
+
+        currentWindowElapsed = 0f;
+        currentWindowSpawnOps = 0;
+        currentWindowDespawnOps = 0;
+    }
+
+    private void UpdateFrameSpikeWindow(float frameTimeMs)
+    {
+        float now = Time.unscaledTime;
+        float window = Mathf.Max(0.5f, spikeWindowSeconds);
+
+        recentFrameTimes.Enqueue(new FrameTimeSample(now, frameTimeMs));
+        while (recentFrameTimes.Count > 0 && now - recentFrameTimes.Peek().Time > window)
+        {
+            recentFrameTimes.Dequeue();
+        }
+
+        float maxMs = 0f;
+        foreach (FrameTimeSample sample in recentFrameTimes)
+        {
+            if (sample.FrameTimeMs > maxMs)
+            {
+                maxMs = sample.FrameTimeMs;
+            }
+        }
+
+        spikeFrameTimeMs = maxMs;
+    }
+
+    private void UpdateGcMetrics()
+    {
+        gc0Delta = System.GC.CollectionCount(0) - gc0Baseline;
+        gc1Delta = System.GC.CollectionCount(1) - gc1Baseline;
+        gc2Delta = System.GC.CollectionCount(2) - gc2Baseline;
+        managedMemoryMb = System.GC.GetTotalMemory(false) / (1024f * 1024f);
+    }
+
+    private void ResetMetricsTracking()
+    {
+        currentWindowSpawnOps = 0;
+        currentWindowDespawnOps = 0;
+        currentWindowElapsed = 0f;
+        spawnOpsPerSecond = 0f;
+        despawnOpsPerSecond = 0f;
+
+        instantiateCount = 0;
+        destroyCount = 0;
+        poolActivateCount = 0;
+        poolDeactivateCount = 0;
+        poolReuseActivateCount = 0;
+        poolFreshActivateCount = 0;
+
+        gc0Baseline = System.GC.CollectionCount(0);
+        gc1Baseline = System.GC.CollectionCount(1);
+        gc2Baseline = System.GC.CollectionCount(2);
+        gc0Delta = 0;
+        gc1Delta = 0;
+        gc2Delta = 0;
+        managedMemoryMb = System.GC.GetTotalMemory(false) / (1024f * 1024f);
+
+        spikeFrameTimeMs = 0f;
+        recentFrameTimes.Clear();
+    }
+
+    private float PoolReusePercent()
+    {
+        if (poolActivateCount <= 0)
+        {
+            return 0f;
+        }
+
+        return (float)poolReuseActivateCount / poolActivateCount * 100f;
     }
 
     private void HandleKeyboardShortcuts()
@@ -234,6 +760,21 @@ public class NaiveSimulationManager : MonoBehaviour
         {
             PreviousPreset();
         }
+
+        if (keyboard.digit1Key.wasPressedThisFrame)
+        {
+            SetPatternNaive();
+        }
+
+        if (keyboard.digit2Key.wasPressedThisFrame)
+        {
+            SetPatternObjectPool();
+        }
+
+        if (keyboard.cKey.wasPressedThisFrame)
+        {
+            ToggleCycleMode();
+        }
 #elif ENABLE_LEGACY_INPUT_MANAGER
         if (Input.GetKeyDown(KeyCode.Space))
         {
@@ -249,6 +790,21 @@ public class NaiveSimulationManager : MonoBehaviour
         {
             PreviousPreset();
         }
+
+        if (Input.GetKeyDown(KeyCode.Alpha1))
+        {
+            SetPatternNaive();
+        }
+
+        if (Input.GetKeyDown(KeyCode.Alpha2))
+        {
+            SetPatternObjectPool();
+        }
+
+        if (Input.GetKeyDown(KeyCode.C))
+        {
+            ToggleCycleMode();
+        }
 #endif
     }
 
@@ -259,32 +815,51 @@ public class NaiveSimulationManager : MonoBehaviour
             return;
         }
 
-        GUI.Box(new Rect(10f, 10f, 360f, 220f), "Naive Vertical Slice");
+        GUI.Box(new Rect(10f, 10f, 460f, 432f), "Naive Vertical Slice");
         GUI.Label(new Rect(20f, 40f, 340f, 22f), $"Pattern: {activePatternLabel}");
-        GUI.Label(new Rect(20f, 62f, 340f, 22f), $"Running: {isRunning}");
-        GUI.Label(new Rect(20f, 84f, 340f, 22f), $"Entity Count: {entities.Count}");
-        GUI.Label(new Rect(20f, 106f, 340f, 22f), $"FPS: {fpsSmoothed:0.0}");
-        GUI.Label(new Rect(20f, 128f, 340f, 22f), $"Frame Time (ms): {frameTimeMsSmoothed:0.00}");
-        GUI.Label(new Rect(20f, 150f, 340f, 22f), $"Preset: {CurrentPresetDisplay()}");
+        GUI.Label(new Rect(20f, 62f, 430f, 22f), $"Running: {isRunning}");
+        int activeCount = activeArchitecture == null ? 0 : activeArchitecture.ActiveEntityCount;
+        GUI.Label(new Rect(20f, 84f, 430f, 22f), $"Entity Count: {activeCount}");
+        GUI.Label(new Rect(20f, 106f, 430f, 22f), $"FPS: {fpsSmoothed:0.0}");
+        GUI.Label(new Rect(20f, 128f, 430f, 22f), $"Frame Time (ms): {frameTimeMsSmoothed:0.00}");
+        GUI.Label(new Rect(20f, 150f, 430f, 22f), $"Spike ({Mathf.Max(0.5f, spikeWindowSeconds):0.0}s max): {spikeFrameTimeMs:0.00} ms");
+        GUI.Label(new Rect(20f, 172f, 430f, 22f), $"Preset: {CurrentPresetDisplay()}");
+        GUI.Label(new Rect(20f, 194f, 430f, 22f), $"Cycle: {CyclePhaseDisplay()}  Target: {cycleTargetCount}  Hold Left: {HoldTimeRemainingSeconds():0.0}s");
+        GUI.Label(new Rect(20f, 216f, 430f, 22f), $"Ops/s  Spawn: {spawnOpsPerSecond:0.0}  Despawn: {despawnOpsPerSecond:0.0}");
+        GUI.Label(new Rect(20f, 238f, 430f, 22f), $"Instantiate: {instantiateCount}  Destroy: {destroyCount}");
+        GUI.Label(new Rect(20f, 260f, 430f, 22f), $"Pool Activate: {poolActivateCount}  Deactivate: {poolDeactivateCount}");
+        GUI.Label(new Rect(20f, 282f, 430f, 22f), $"Pool Reuse: {poolReuseActivateCount} ({PoolReusePercent():0.0}%)  Fresh: {poolFreshActivateCount}");
+        GUI.Label(new Rect(20f, 304f, 430f, 22f), $"GC Delta  G0:{gc0Delta}  G1:{gc1Delta}  G2:{gc2Delta}  Mem:{managedMemoryMb:0.0} MB");
+        GUI.Label(new Rect(20f, 326f, 430f, 22f), "Pattern Keys: 1=Naive, 2=ObjectPool, C=Cycle");
 
-        if (GUI.Button(new Rect(20f, 176f, 72f, 28f), isRunning ? "Stop" : "Start"))
+        if (GUI.Button(new Rect(20f, 354f, 72f, 22f), isRunning ? "Stop" : "Start"))
         {
             ToggleSimulation();
         }
 
-        if (GUI.Button(new Rect(98f, 176f, 36f, 28f), "<"))
+        if (GUI.Button(new Rect(98f, 354f, 36f, 22f), "<"))
         {
             PreviousPreset();
         }
 
-        if (GUI.Button(new Rect(138f, 176f, 36f, 28f), ">"))
+        if (GUI.Button(new Rect(138f, 354f, 36f, 22f), ">"))
         {
             NextPreset();
         }
 
-        if (GUI.Button(new Rect(180f, 176f, 84f, 28f), "Apply"))
+        if (GUI.Button(new Rect(180f, 354f, 84f, 22f), "Apply"))
         {
             ApplySelectedPreset();
+        }
+
+        if (GUI.Button(new Rect(270f, 354f, 80f, 22f), "Pattern"))
+        {
+            NextPattern();
+        }
+
+        if (GUI.Button(new Rect(20f, 382f, 120f, 22f), enableAutoCycleMode ? "Cycle: On" : "Cycle: Off"))
+        {
+            ToggleCycleMode();
         }
     }
 
@@ -302,5 +877,341 @@ public class NaiveSimulationManager : MonoBehaviour
     {
         Gizmos.color = Color.cyan;
         Gizmos.DrawWireCube(transform.position, boundsHalfExtents * 2f);
+    }
+
+    private void OnDestroy()
+    {
+        if (activeArchitecture != null)
+        {
+            activeArchitecture.Cleanup();
+        }
+    }
+}
+
+public class NaiveSimulationArchitecture : ISimulationArchitecture
+{
+    private readonly ISimulationRuntimeContext runtimeContext;
+    private readonly GameObject entityPrefab;
+    private readonly Transform entityParent;
+    private readonly float minSpeed;
+    private readonly float maxSpeed;
+    private readonly float minRotationSpeed;
+    private readonly float maxRotationSpeed;
+    private readonly System.Action onInstantiate;
+    private readonly System.Action onDestroy;
+
+    private readonly List<NaiveEntityController> entities = new List<NaiveEntityController>();
+
+    public string Name => "Naive";
+    public bool IsInitialized { get; private set; }
+    public int ActiveEntityCount => entities.Count;
+
+    public NaiveSimulationArchitecture(
+        ISimulationRuntimeContext runtimeContext,
+        GameObject entityPrefab,
+        Transform entityParent,
+        float minSpeed,
+        float maxSpeed,
+        float minRotationSpeed,
+        float maxRotationSpeed,
+        System.Action onInstantiate,
+        System.Action onDestroy)
+    {
+        this.runtimeContext = runtimeContext;
+        this.entityPrefab = entityPrefab;
+        this.entityParent = entityParent;
+        this.minSpeed = minSpeed;
+        this.maxSpeed = maxSpeed;
+        this.minRotationSpeed = minRotationSpeed;
+        this.maxRotationSpeed = maxRotationSpeed;
+        this.onInstantiate = onInstantiate;
+        this.onDestroy = onDestroy;
+    }
+
+    public void Initialize()
+    {
+        IsInitialized = true;
+    }
+
+    public void UpdateSimulation(float deltaTime)
+    {
+        // Naive entities self-update in their MonoBehaviour Update loop.
+    }
+
+    public void SetEntityCount(int count)
+    {
+        count = Mathf.Max(0, count);
+
+        while (entities.Count < count)
+        {
+            SpawnEntity();
+        }
+
+        while (entities.Count > count)
+        {
+            DespawnLastEntity();
+        }
+    }
+
+    public void Cleanup()
+    {
+        for (int i = entities.Count - 1; i >= 0; i--)
+        {
+            NaiveEntityController entity = entities[i];
+            if (entity != null)
+            {
+                Object.Destroy(entity.gameObject);
+            }
+        }
+
+        entities.Clear();
+        IsInitialized = false;
+    }
+
+    private void SpawnEntity()
+    {
+        Vector3 spawnPosition = runtimeContext.SimulationCenter + new Vector3(
+            Random.Range(-runtimeContext.SimulationBoundsHalfExtents.x, runtimeContext.SimulationBoundsHalfExtents.x),
+            Random.Range(-runtimeContext.SimulationBoundsHalfExtents.y, runtimeContext.SimulationBoundsHalfExtents.y),
+            Random.Range(-runtimeContext.SimulationBoundsHalfExtents.z, runtimeContext.SimulationBoundsHalfExtents.z));
+
+        GameObject instance = Object.Instantiate(entityPrefab, spawnPosition, Quaternion.identity, entityParent);
+        onInstantiate?.Invoke();
+
+        NaiveEntityController controller = instance.GetComponent<NaiveEntityController>();
+        if (controller == null)
+        {
+            controller = instance.AddComponent<NaiveEntityController>();
+        }
+
+        Vector3 velocity = RandomVelocity();
+        Vector3 rotationAxis = Random.onUnitSphere;
+        float rotationSpeed = Random.Range(minRotationSpeed, maxRotationSpeed);
+
+        controller.Initialize(runtimeContext, velocity, rotationAxis, rotationSpeed);
+        entities.Add(controller);
+    }
+
+    private void DespawnLastEntity()
+    {
+        int lastIndex = entities.Count - 1;
+        NaiveEntityController entity = entities[lastIndex];
+        entities.RemoveAt(lastIndex);
+
+        if (entity != null)
+        {
+            Object.Destroy(entity.gameObject);
+            onDestroy?.Invoke();
+        }
+    }
+
+    private Vector3 RandomVelocity()
+    {
+        Vector3 direction = Random.onUnitSphere;
+        direction.y *= 0.35f;
+        if (direction.sqrMagnitude < 0.001f)
+        {
+            direction = Vector3.forward;
+        }
+
+        direction.Normalize();
+        float speed = Random.Range(minSpeed, maxSpeed);
+        return direction * speed;
+    }
+}
+
+public class ObjectPoolSimulationArchitecture : ISimulationArchitecture
+{
+    private readonly ISimulationRuntimeContext runtimeContext;
+    private readonly GameObject entityPrefab;
+    private readonly Transform entityParent;
+    private readonly float minSpeed;
+    private readonly float maxSpeed;
+    private readonly float minRotationSpeed;
+    private readonly float maxRotationSpeed;
+    private readonly int prewarmCount;
+    private readonly bool shouldPrewarm;
+    private readonly System.Action onInstantiate;
+    private readonly System.Action<bool> onPoolActivate;
+    private readonly System.Action onPoolDeactivate;
+    private readonly System.Action onDestroy;
+
+    private readonly List<NaiveEntityController> activeEntities = new List<NaiveEntityController>();
+    private readonly Stack<NaiveEntityController> inactiveEntities = new Stack<NaiveEntityController>();
+    private readonly List<NaiveEntityController> allEntities = new List<NaiveEntityController>();
+
+    public string Name => "ObjectPool";
+    public bool IsInitialized { get; private set; }
+    public int ActiveEntityCount => activeEntities.Count;
+
+    public ObjectPoolSimulationArchitecture(
+        ISimulationRuntimeContext runtimeContext,
+        GameObject entityPrefab,
+        Transform entityParent,
+        float minSpeed,
+        float maxSpeed,
+        float minRotationSpeed,
+        float maxRotationSpeed,
+        int prewarmCount,
+        bool shouldPrewarm,
+        System.Action onInstantiate,
+        System.Action<bool> onPoolActivate,
+        System.Action onPoolDeactivate,
+        System.Action onDestroy)
+    {
+        this.runtimeContext = runtimeContext;
+        this.entityPrefab = entityPrefab;
+        this.entityParent = entityParent;
+        this.minSpeed = minSpeed;
+        this.maxSpeed = maxSpeed;
+        this.minRotationSpeed = minRotationSpeed;
+        this.maxRotationSpeed = maxRotationSpeed;
+        this.prewarmCount = Mathf.Max(0, prewarmCount);
+        this.shouldPrewarm = shouldPrewarm;
+        this.onInstantiate = onInstantiate;
+        this.onPoolActivate = onPoolActivate;
+        this.onPoolDeactivate = onPoolDeactivate;
+        this.onDestroy = onDestroy;
+    }
+
+    public void Initialize()
+    {
+        IsInitialized = true;
+
+        if (!shouldPrewarm || prewarmCount <= 0 || allEntities.Count > 0)
+        {
+            return;
+        }
+
+        for (int i = 0; i < prewarmCount; i++)
+        {
+            NaiveEntityController controller = CreatePooledEntity();
+            DeactivateEntity(controller, false);
+        }
+    }
+
+    public void UpdateSimulation(float deltaTime)
+    {
+        // Active pooled entities self-update in their MonoBehaviour Update loop.
+    }
+
+    public void SetEntityCount(int count)
+    {
+        count = Mathf.Max(0, count);
+
+        while (activeEntities.Count < count)
+        {
+            ActivateEntityFromPool();
+        }
+
+        while (activeEntities.Count > count)
+        {
+            DeactivateLastActiveEntity();
+        }
+    }
+
+    public void Cleanup()
+    {
+        for (int i = allEntities.Count - 1; i >= 0; i--)
+        {
+            NaiveEntityController entity = allEntities[i];
+            if (entity != null)
+            {
+                Object.Destroy(entity.gameObject);
+                onDestroy?.Invoke();
+            }
+        }
+
+        activeEntities.Clear();
+        inactiveEntities.Clear();
+        allEntities.Clear();
+        IsInitialized = false;
+    }
+
+    private void ActivateEntityFromPool()
+    {
+        bool reused = inactiveEntities.Count > 0;
+        NaiveEntityController controller = reused
+            ? inactiveEntities.Pop()
+            : CreatePooledEntity();
+
+        if (controller == null)
+        {
+            return;
+        }
+
+        GameObject entityObject = controller.gameObject;
+        entityObject.transform.position = RandomSpawnPosition();
+        entityObject.transform.rotation = Quaternion.identity;
+        entityObject.SetActive(true);
+
+        Vector3 velocity = RandomVelocity();
+        Vector3 rotationAxis = Random.onUnitSphere;
+        float rotationSpeed = Random.Range(minRotationSpeed, maxRotationSpeed);
+
+        controller.Initialize(runtimeContext, velocity, rotationAxis, rotationSpeed);
+        activeEntities.Add(controller);
+        onPoolActivate?.Invoke(reused);
+    }
+
+    private void DeactivateLastActiveEntity()
+    {
+        int lastIndex = activeEntities.Count - 1;
+        NaiveEntityController entity = activeEntities[lastIndex];
+        activeEntities.RemoveAt(lastIndex);
+        DeactivateEntity(entity, true);
+    }
+
+    private void DeactivateEntity(NaiveEntityController entity, bool countAsOperation)
+    {
+        if (entity == null)
+        {
+            return;
+        }
+
+        entity.gameObject.SetActive(false);
+        inactiveEntities.Push(entity);
+
+        if (countAsOperation)
+        {
+            onPoolDeactivate?.Invoke();
+        }
+    }
+
+    private NaiveEntityController CreatePooledEntity()
+    {
+        GameObject instance = Object.Instantiate(entityPrefab, runtimeContext.SimulationCenter, Quaternion.identity, entityParent);
+        onInstantiate?.Invoke();
+
+        NaiveEntityController controller = instance.GetComponent<NaiveEntityController>();
+        if (controller == null)
+        {
+            controller = instance.AddComponent<NaiveEntityController>();
+        }
+
+        allEntities.Add(controller);
+        return controller;
+    }
+
+    private Vector3 RandomSpawnPosition()
+    {
+        return runtimeContext.SimulationCenter + new Vector3(
+            Random.Range(-runtimeContext.SimulationBoundsHalfExtents.x, runtimeContext.SimulationBoundsHalfExtents.x),
+            Random.Range(-runtimeContext.SimulationBoundsHalfExtents.y, runtimeContext.SimulationBoundsHalfExtents.y),
+            Random.Range(-runtimeContext.SimulationBoundsHalfExtents.z, runtimeContext.SimulationBoundsHalfExtents.z));
+    }
+
+    private Vector3 RandomVelocity()
+    {
+        Vector3 direction = Random.onUnitSphere;
+        direction.y *= 0.35f;
+        if (direction.sqrMagnitude < 0.001f)
+        {
+            direction = Vector3.forward;
+        }
+
+        direction.Normalize();
+        float speed = Random.Range(minSpeed, maxSpeed);
+        return direction * speed;
     }
 }
