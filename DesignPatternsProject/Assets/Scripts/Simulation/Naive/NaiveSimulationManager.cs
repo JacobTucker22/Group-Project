@@ -51,6 +51,16 @@ public class NaiveSimulationManager : MonoBehaviour, ISimulationRuntimeContext
         }
     }
 
+    private struct RunSummary
+    {
+        public string PatternName;
+        public float AvgSetCountMs;
+        public float P95SetCountMs;
+        public float MaxSetCountMs;
+        public float AvgGc0IntervalSeconds;
+        public float SpikeFrameTimeMs;
+    }
+
     [Header("Naive Pattern")]
     [SerializeField] private string activePatternLabel = "Naive";
     [SerializeField] private GameObject entityPrefab;
@@ -124,6 +134,33 @@ public class NaiveSimulationManager : MonoBehaviour, ISimulationRuntimeContext
     private readonly Queue<FrameTimeSample> recentFrameTimes = new Queue<FrameTimeSample>();
     private float churnOperationAccumulator;
     private int churnDirection = 1;
+
+    private const int MaxSetCountTimingSamples = 128;
+    private readonly float[] setCountTimingSamples = new float[MaxSetCountTimingSamples];
+    private int setCountTimingSampleCount;
+    private int setCountTimingSampleWriteIndex;
+    private float lastSetCountMs;
+    private float avgSetCountMs;
+    private float maxSetCountMs;
+    private float p95SetCountMs;
+    private long setCountCallCount;
+    private double setCountTotalMs;
+
+    private float resetTimestamp;
+    private int gc0LastCount;
+    private int gc1LastCount;
+    private int gc2LastCount;
+    private float gc0LastEventTime;
+    private float gc1LastEventTime;
+    private float gc2LastEventTime;
+    private float gc0SecondsSinceLast;
+    private float gc1SecondsSinceLast;
+    private float gc2SecondsSinceLast;
+    private float gc0IntervalTotalSeconds;
+    private int gc0IntervalCount;
+
+    private bool previousRunSummaryAvailable;
+    private RunSummary previousRunSummary;
 
     public bool IsRunning => isRunning;
     public Vector3 BoundsHalfExtents => boundsHalfExtents;
@@ -360,7 +397,10 @@ public class NaiveSimulationManager : MonoBehaviour, ISimulationRuntimeContext
         }
 
         int clampedCount = Mathf.Max(0, count);
+        double begin = Time.realtimeSinceStartupAsDouble;
         activeArchitecture.SetEntityCount(clampedCount);
+        float elapsedMs = (float)((Time.realtimeSinceStartupAsDouble - begin) * 1000.0);
+        RecordSetCountTiming(elapsedMs);
         lastAppliedCount = clampedCount;
     }
 
@@ -428,6 +468,8 @@ public class NaiveSimulationManager : MonoBehaviour, ISimulationRuntimeContext
         {
             return;
         }
+
+        CaptureCurrentRunSummary();
 
         int currentCount = activeArchitecture == null ? 0 : activeArchitecture.ActiveEntityCount;
         bool wasRunning = isRunning;
@@ -777,6 +819,35 @@ public class NaiveSimulationManager : MonoBehaviour, ISimulationRuntimeContext
         gc1Delta = System.GC.CollectionCount(1) - gc1Baseline;
         gc2Delta = System.GC.CollectionCount(2) - gc2Baseline;
         managedMemoryMb = System.GC.GetTotalMemory(false) / (1024f * 1024f);
+
+        float now = Time.unscaledTime;
+        gc0SecondsSinceLast = Mathf.Max(0f, now - gc0LastEventTime);
+        gc1SecondsSinceLast = Mathf.Max(0f, now - gc1LastEventTime);
+        gc2SecondsSinceLast = Mathf.Max(0f, now - gc2LastEventTime);
+
+        if (gc0Delta > gc0LastCount)
+        {
+            float interval = Mathf.Max(0f, now - gc0LastEventTime);
+            gc0IntervalTotalSeconds += interval;
+            gc0IntervalCount++;
+            gc0LastEventTime = now;
+            gc0LastCount = gc0Delta;
+            gc0SecondsSinceLast = 0f;
+        }
+
+        if (gc1Delta > gc1LastCount)
+        {
+            gc1LastEventTime = now;
+            gc1LastCount = gc1Delta;
+            gc1SecondsSinceLast = 0f;
+        }
+
+        if (gc2Delta > gc2LastCount)
+        {
+            gc2LastEventTime = now;
+            gc2LastCount = gc2Delta;
+            gc2SecondsSinceLast = 0f;
+        }
     }
 
     private void ResetMetricsTracking()
@@ -806,6 +877,101 @@ public class NaiveSimulationManager : MonoBehaviour, ISimulationRuntimeContext
         recentFrameTimes.Clear();
         churnOperationAccumulator = 0f;
         churnDirection = 1;
+
+        setCountTimingSampleCount = 0;
+        setCountTimingSampleWriteIndex = 0;
+        lastSetCountMs = 0f;
+        avgSetCountMs = 0f;
+        maxSetCountMs = 0f;
+        p95SetCountMs = 0f;
+        setCountCallCount = 0;
+        setCountTotalMs = 0.0;
+
+        resetTimestamp = Time.unscaledTime;
+        gc0LastCount = 0;
+        gc1LastCount = 0;
+        gc2LastCount = 0;
+        gc0LastEventTime = resetTimestamp;
+        gc1LastEventTime = resetTimestamp;
+        gc2LastEventTime = resetTimestamp;
+        gc0SecondsSinceLast = 0f;
+        gc1SecondsSinceLast = 0f;
+        gc2SecondsSinceLast = 0f;
+        gc0IntervalTotalSeconds = 0f;
+        gc0IntervalCount = 0;
+    }
+
+    private void RecordSetCountTiming(float elapsedMs)
+    {
+        float clamped = Mathf.Max(0f, elapsedMs);
+        lastSetCountMs = clamped;
+        setCountCallCount++;
+        setCountTotalMs += clamped;
+        avgSetCountMs = (float)(setCountTotalMs / setCountCallCount);
+        maxSetCountMs = Mathf.Max(maxSetCountMs, clamped);
+
+        setCountTimingSamples[setCountTimingSampleWriteIndex] = clamped;
+        setCountTimingSampleWriteIndex = (setCountTimingSampleWriteIndex + 1) % MaxSetCountTimingSamples;
+        if (setCountTimingSampleCount < MaxSetCountTimingSamples)
+        {
+            setCountTimingSampleCount++;
+        }
+
+        p95SetCountMs = ComputeP95SetCountMs();
+    }
+
+    private float ComputeP95SetCountMs()
+    {
+        if (setCountTimingSampleCount <= 0)
+        {
+            return 0f;
+        }
+
+        float[] scratch = new float[setCountTimingSampleCount];
+        for (int i = 0; i < setCountTimingSampleCount; i++)
+        {
+            scratch[i] = setCountTimingSamples[i];
+        }
+
+        System.Array.Sort(scratch);
+        int index = Mathf.Clamp(Mathf.CeilToInt(setCountTimingSampleCount * 0.95f) - 1, 0, setCountTimingSampleCount - 1);
+        return scratch[index];
+    }
+
+    private float AverageGc0IntervalSeconds()
+    {
+        if (gc0IntervalCount <= 0)
+        {
+            return 0f;
+        }
+
+        return gc0IntervalTotalSeconds / gc0IntervalCount;
+    }
+
+    private void CaptureCurrentRunSummary()
+    {
+        if (!isRunning)
+        {
+            return;
+        }
+
+        previousRunSummary = new RunSummary
+        {
+            PatternName = activePatternLabel,
+            AvgSetCountMs = avgSetCountMs,
+            P95SetCountMs = p95SetCountMs,
+            MaxSetCountMs = maxSetCountMs,
+            AvgGc0IntervalSeconds = AverageGc0IntervalSeconds(),
+            SpikeFrameTimeMs = spikeFrameTimeMs
+        };
+        previousRunSummaryAvailable = true;
+    }
+
+    private string FormatDelta(float currentValue, float baselineValue)
+    {
+        float delta = currentValue - baselineValue;
+        string sign = delta > 0f ? "+" : string.Empty;
+        return sign + delta.ToString("0.00");
     }
 
     private float PoolReusePercent()
@@ -906,55 +1072,66 @@ public class NaiveSimulationManager : MonoBehaviour, ISimulationRuntimeContext
             return;
         }
 
-        GUI.Box(new Rect(10f, 10f, 460f, 460f), "Naive Vertical Slice");
+        GUI.Box(new Rect(10f, 10f, 560f, 560f), "Naive Vertical Slice");
         GUI.Label(new Rect(20f, 40f, 340f, 22f), $"Pattern: {activePatternLabel}");
-        GUI.Label(new Rect(20f, 62f, 430f, 22f), $"Running: {isRunning}");
+        GUI.Label(new Rect(20f, 62f, 530f, 22f), $"Running: {isRunning}");
         int activeCount = activeArchitecture == null ? 0 : activeArchitecture.ActiveEntityCount;
-        GUI.Label(new Rect(20f, 84f, 430f, 22f), $"Entity Count: {activeCount}");
-        GUI.Label(new Rect(20f, 106f, 430f, 22f), $"FPS: {fpsSmoothed:0.0}");
-        GUI.Label(new Rect(20f, 128f, 430f, 22f), $"Frame Time (ms): {frameTimeMsSmoothed:0.00}");
-        GUI.Label(new Rect(20f, 150f, 430f, 22f), $"Spike ({Mathf.Max(0.5f, spikeWindowSeconds):0.0}s max): {spikeFrameTimeMs:0.00} ms");
-        GUI.Label(new Rect(20f, 172f, 430f, 22f), $"Preset: {CurrentPresetDisplay()}");
-        GUI.Label(new Rect(20f, 194f, 430f, 22f), $"Cycle: {CyclePhaseDisplay()}  Target: {cycleTargetCount}  Hold Left: {HoldTimeRemainingSeconds():0.0}s");
-        GUI.Label(new Rect(20f, 216f, 430f, 22f), $"Background Churn: {(enableBackgroundChurnMode ? "On" : "Off")}");
-        GUI.Label(new Rect(20f, 238f, 430f, 22f), $"Ops/s  Spawn: {spawnOpsPerSecond:0.0}  Despawn: {despawnOpsPerSecond:0.0}");
-        GUI.Label(new Rect(20f, 260f, 430f, 22f), $"Instantiate: {instantiateCount}  Destroy: {destroyCount}");
-        GUI.Label(new Rect(20f, 282f, 430f, 22f), $"Pool Activate: {poolActivateCount}  Deactivate: {poolDeactivateCount}");
-        GUI.Label(new Rect(20f, 304f, 430f, 22f), $"Pool Reuse: {poolReuseActivateCount} ({PoolReusePercent():0.0}%)  Fresh: {poolFreshActivateCount}");
-        GUI.Label(new Rect(20f, 326f, 430f, 22f), $"GC Delta  G0:{gc0Delta}  G1:{gc1Delta}  G2:{gc2Delta}  Mem:{managedMemoryMb:0.0} MB");
-        GUI.Label(new Rect(20f, 348f, 430f, 22f), "Pattern Keys: 1=Naive, 2=ObjectPool, C=Cycle, B=Churn");
+        GUI.Label(new Rect(20f, 84f, 530f, 22f), $"Entity Count: {activeCount}");
+        GUI.Label(new Rect(20f, 106f, 530f, 22f), $"FPS: {fpsSmoothed:0.0}");
+        GUI.Label(new Rect(20f, 128f, 530f, 22f), $"Frame Time (ms): {frameTimeMsSmoothed:0.00}");
+        GUI.Label(new Rect(20f, 150f, 530f, 22f), $"Spike ({Mathf.Max(0.5f, spikeWindowSeconds):0.0}s max): {spikeFrameTimeMs:0.00} ms");
+        GUI.Label(new Rect(20f, 172f, 530f, 22f), $"Preset: {CurrentPresetDisplay()}");
+        GUI.Label(new Rect(20f, 194f, 530f, 22f), $"Cycle: {CyclePhaseDisplay()}  Target: {cycleTargetCount}  Hold Left: {HoldTimeRemainingSeconds():0.0}s");
+        GUI.Label(new Rect(20f, 216f, 530f, 22f), $"Background Churn: {(enableBackgroundChurnMode ? "On" : "Off")}");
+        GUI.Label(new Rect(20f, 238f, 530f, 22f), $"Ops/s  Spawn: {spawnOpsPerSecond:0.0}  Despawn: {despawnOpsPerSecond:0.0}");
+        GUI.Label(new Rect(20f, 260f, 530f, 22f), $"SetCount ms  Last:{lastSetCountMs:0.000}  Avg:{avgSetCountMs:0.000}  P95:{p95SetCountMs:0.000}  Max:{maxSetCountMs:0.000}");
+        GUI.Label(new Rect(20f, 282f, 530f, 22f), $"Instantiate: {instantiateCount}  Destroy: {destroyCount}");
+        GUI.Label(new Rect(20f, 304f, 530f, 22f), $"Pool Activate: {poolActivateCount}  Deactivate: {poolDeactivateCount}");
+        GUI.Label(new Rect(20f, 326f, 530f, 22f), $"Pool Reuse: {poolReuseActivateCount} ({PoolReusePercent():0.0}%)  Fresh: {poolFreshActivateCount}");
+        GUI.Label(new Rect(20f, 348f, 530f, 22f), $"GC Delta  G0:{gc0Delta}  G1:{gc1Delta}  G2:{gc2Delta}  Mem:{managedMemoryMb:0.0} MB");
+        GUI.Label(new Rect(20f, 370f, 530f, 22f), $"GC since last (s)  G0:{gc0SecondsSinceLast:0.00}  G1:{gc1SecondsSinceLast:0.00}  G2:{gc2SecondsSinceLast:0.00}");
+        GUI.Label(new Rect(20f, 392f, 530f, 22f), $"Avg G0 interval (s): {AverageGc0IntervalSeconds():0.00}");
 
-        if (GUI.Button(new Rect(20f, 376f, 72f, 22f), isRunning ? "Stop" : "Start"))
+        if (previousRunSummaryAvailable)
+        {
+            GUI.Label(
+                new Rect(20f, 414f, 530f, 22f),
+                $"Prev [{previousRunSummary.PatternName}]  P95 SetCount Δ:{FormatDelta(p95SetCountMs, previousRunSummary.P95SetCountMs)} ms  Avg G0 Δ:{FormatDelta(AverageGc0IntervalSeconds(), previousRunSummary.AvgGc0IntervalSeconds)} s  Spike Δ:{FormatDelta(spikeFrameTimeMs, previousRunSummary.SpikeFrameTimeMs)} ms");
+        }
+
+        GUI.Label(new Rect(20f, 436f, 530f, 22f), "Pattern Keys: 1=Naive, 2=ObjectPool, C=Cycle, B=Churn");
+
+        if (GUI.Button(new Rect(20f, 464f, 72f, 22f), isRunning ? "Stop" : "Start"))
         {
             ToggleSimulation();
         }
 
-        if (GUI.Button(new Rect(98f, 376f, 36f, 22f), "<"))
+        if (GUI.Button(new Rect(98f, 464f, 36f, 22f), "<"))
         {
             PreviousPreset();
         }
 
-        if (GUI.Button(new Rect(138f, 376f, 36f, 22f), ">"))
+        if (GUI.Button(new Rect(138f, 464f, 36f, 22f), ">"))
         {
             NextPreset();
         }
 
-        if (GUI.Button(new Rect(180f, 376f, 84f, 22f), "Apply"))
+        if (GUI.Button(new Rect(180f, 464f, 84f, 22f), "Apply"))
         {
             ApplySelectedPreset();
         }
 
-        if (GUI.Button(new Rect(270f, 376f, 80f, 22f), "Pattern"))
+        if (GUI.Button(new Rect(270f, 464f, 80f, 22f), "Pattern"))
         {
             NextPattern();
         }
 
-        if (GUI.Button(new Rect(20f, 404f, 120f, 22f), enableAutoCycleMode ? "Cycle: On" : "Cycle: Off"))
+        if (GUI.Button(new Rect(20f, 492f, 120f, 22f), enableAutoCycleMode ? "Cycle: On" : "Cycle: Off"))
         {
             ToggleCycleMode();
         }
 
-        if (GUI.Button(new Rect(148f, 404f, 130f, 22f), enableBackgroundChurnMode ? "Churn: On" : "Churn: Off"))
+        if (GUI.Button(new Rect(148f, 492f, 130f, 22f), enableBackgroundChurnMode ? "Churn: On" : "Churn: Off"))
         {
             ToggleBackgroundChurnMode();
         }

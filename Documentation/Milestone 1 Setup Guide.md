@@ -61,11 +61,22 @@ Note: `ObjectPoolSimulationArchitecture` is currently implemented in the same fi
 ## HUD Metrics to Compare
 1. `Spike (Xs max)`: highest frame time seen in the recent window. Lower is better for stability.
 1. `Ops/s Spawn` and `Ops/s Despawn`: current lifecycle churn rate.
+1. `SetCount ms Last/Avg/P95/Max`: time spent in count-change operations (`SetEntityCount` path). This is the clearest direct measure of instantiate/destroy vs pool activate/deactivate cost.
 1. `Instantiate` and `Destroy`: total expensive create/remove operations. Naive usually climbs faster here.
 1. `Pool Activate` and `Pool Deactivate`: reuse operations performed by object pool.
 1. `Pool Reuse`: percentage of activations served from inactive pool instead of fresh instantiation.
 1. `GC Delta G0/G1/G2`: garbage collection counts since simulation start.
+1. `GC since last (s) G0/G1/G2`: elapsed time since last collection per generation.
+1. `Avg G0 interval (s)`: average time between Gen0 collections during current run.
 1. `Mem`: managed memory estimate in MB.
+
+## Pattern Switch Snapshot
+1. When switching patterns, the HUD keeps a `Prev [...]` summary line.
+1. It shows deltas for current vs previous run:
+- `P95 SetCount Δ`
+- `Avg G0 Δ`
+- `Spike Δ`
+1. Use this for quick A/B comparison without manually recording values.
 
 When comparing patterns, use equal cycle settings and prioritize lower spike frame times and lower GC deltas over raw average FPS.
 
