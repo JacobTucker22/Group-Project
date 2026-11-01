@@ -78,6 +78,11 @@ public class NaiveSimulationManager : MonoBehaviour, ISimulationRuntimeContext
     [SerializeField] private bool loopCycle = true;
     [SerializeField] private bool resetToZeroOnStop = true;
 
+    [Header("Background Churn Mode")]
+    [SerializeField] private bool enableBackgroundChurnMode;
+    [SerializeField] private float churnRatePerSecond = 240f;
+    [SerializeField] private float churnBandPercent = 0.08f;
+
     [Header("Debug UI")]
     [SerializeField] private bool showRuntimeOverlay = true;
     [SerializeField] private float spikeWindowSeconds = 5f;
@@ -117,6 +122,8 @@ public class NaiveSimulationManager : MonoBehaviour, ISimulationRuntimeContext
 
     private float spikeFrameTimeMs;
     private readonly Queue<FrameTimeSample> recentFrameTimes = new Queue<FrameTimeSample>();
+    private float churnOperationAccumulator;
+    private int churnDirection = 1;
 
     public bool IsRunning => isRunning;
     public Vector3 BoundsHalfExtents => boundsHalfExtents;
@@ -218,6 +225,10 @@ public class NaiveSimulationManager : MonoBehaviour, ISimulationRuntimeContext
             {
                 UpdateCycleMode(Time.deltaTime);
             }
+            else if (enableBackgroundChurnMode)
+            {
+                UpdateBackgroundChurnMode(Time.deltaTime);
+            }
 
             activeArchitecture.UpdateSimulation(Time.deltaTime);
         }
@@ -290,6 +301,8 @@ public class NaiveSimulationManager : MonoBehaviour, ISimulationRuntimeContext
         {
             return;
         }
+
+        ResetMetricsTracking();
 
         if (isRunning && enableAutoCycleMode)
         {
@@ -440,11 +453,20 @@ public class NaiveSimulationManager : MonoBehaviour, ISimulationRuntimeContext
                 cycleCountAtPhaseStart = currentCount;
             }
         }
+
+        ResetMetricsTracking();
     }
 
     public void ToggleCycleMode()
     {
         enableAutoCycleMode = !enableAutoCycleMode;
+
+        if (enableAutoCycleMode)
+        {
+            enableBackgroundChurnMode = false;
+        }
+
+        ResetMetricsTracking();
 
         if (!isRunning)
         {
@@ -460,6 +482,20 @@ public class NaiveSimulationManager : MonoBehaviour, ISimulationRuntimeContext
 
         ResetCycleState();
         SetEntityCount(GetSelectedPresetCount());
+    }
+
+    public void ToggleBackgroundChurnMode()
+    {
+        enableBackgroundChurnMode = !enableBackgroundChurnMode;
+
+        if (enableBackgroundChurnMode)
+        {
+            enableAutoCycleMode = false;
+            ResetCycleState();
+            SetEntityCount(GetSelectedPresetCount());
+        }
+
+        ResetMetricsTracking();
     }
 
     private void RestartCycleFromZero()
@@ -511,6 +547,49 @@ public class NaiveSimulationManager : MonoBehaviour, ISimulationRuntimeContext
             case CyclePhase.RampDown:
                 UpdateRampDownPhase();
                 break;
+        }
+    }
+
+    private void UpdateBackgroundChurnMode(float deltaTime)
+    {
+        int target = GetSelectedPresetCount();
+        if (target <= 0)
+        {
+            return;
+        }
+
+        int band = Mathf.Max(1, Mathf.RoundToInt(target * Mathf.Clamp(churnBandPercent, 0.01f, 0.45f)));
+        int lowerBound = Mathf.Max(0, target - band);
+        int upperBound = target + band;
+
+        float safeRate = Mathf.Max(1f, churnRatePerSecond);
+        churnOperationAccumulator += Mathf.Max(0f, deltaTime) * safeRate;
+        int operations = Mathf.FloorToInt(churnOperationAccumulator);
+        if (operations <= 0)
+        {
+            return;
+        }
+
+        churnOperationAccumulator -= operations;
+        for (int i = 0; i < operations; i++)
+        {
+            int current = activeArchitecture.ActiveEntityCount;
+
+            if (current <= lowerBound)
+            {
+                churnDirection = 1;
+            }
+            else if (current >= upperBound)
+            {
+                churnDirection = -1;
+            }
+            else
+            {
+                churnDirection = -churnDirection;
+            }
+
+            int desired = Mathf.Max(0, current + churnDirection);
+            ApplyEntityCountIfChanged(desired);
         }
     }
 
@@ -725,6 +804,8 @@ public class NaiveSimulationManager : MonoBehaviour, ISimulationRuntimeContext
 
         spikeFrameTimeMs = 0f;
         recentFrameTimes.Clear();
+        churnOperationAccumulator = 0f;
+        churnDirection = 1;
     }
 
     private float PoolReusePercent()
@@ -775,6 +856,11 @@ public class NaiveSimulationManager : MonoBehaviour, ISimulationRuntimeContext
         {
             ToggleCycleMode();
         }
+
+        if (keyboard.bKey.wasPressedThisFrame)
+        {
+            ToggleBackgroundChurnMode();
+        }
 #elif ENABLE_LEGACY_INPUT_MANAGER
         if (Input.GetKeyDown(KeyCode.Space))
         {
@@ -805,6 +891,11 @@ public class NaiveSimulationManager : MonoBehaviour, ISimulationRuntimeContext
         {
             ToggleCycleMode();
         }
+
+        if (Input.GetKeyDown(KeyCode.B))
+        {
+            ToggleBackgroundChurnMode();
+        }
 #endif
     }
 
@@ -815,7 +906,7 @@ public class NaiveSimulationManager : MonoBehaviour, ISimulationRuntimeContext
             return;
         }
 
-        GUI.Box(new Rect(10f, 10f, 460f, 432f), "Naive Vertical Slice");
+        GUI.Box(new Rect(10f, 10f, 460f, 460f), "Naive Vertical Slice");
         GUI.Label(new Rect(20f, 40f, 340f, 22f), $"Pattern: {activePatternLabel}");
         GUI.Label(new Rect(20f, 62f, 430f, 22f), $"Running: {isRunning}");
         int activeCount = activeArchitecture == null ? 0 : activeArchitecture.ActiveEntityCount;
@@ -825,41 +916,47 @@ public class NaiveSimulationManager : MonoBehaviour, ISimulationRuntimeContext
         GUI.Label(new Rect(20f, 150f, 430f, 22f), $"Spike ({Mathf.Max(0.5f, spikeWindowSeconds):0.0}s max): {spikeFrameTimeMs:0.00} ms");
         GUI.Label(new Rect(20f, 172f, 430f, 22f), $"Preset: {CurrentPresetDisplay()}");
         GUI.Label(new Rect(20f, 194f, 430f, 22f), $"Cycle: {CyclePhaseDisplay()}  Target: {cycleTargetCount}  Hold Left: {HoldTimeRemainingSeconds():0.0}s");
-        GUI.Label(new Rect(20f, 216f, 430f, 22f), $"Ops/s  Spawn: {spawnOpsPerSecond:0.0}  Despawn: {despawnOpsPerSecond:0.0}");
-        GUI.Label(new Rect(20f, 238f, 430f, 22f), $"Instantiate: {instantiateCount}  Destroy: {destroyCount}");
-        GUI.Label(new Rect(20f, 260f, 430f, 22f), $"Pool Activate: {poolActivateCount}  Deactivate: {poolDeactivateCount}");
-        GUI.Label(new Rect(20f, 282f, 430f, 22f), $"Pool Reuse: {poolReuseActivateCount} ({PoolReusePercent():0.0}%)  Fresh: {poolFreshActivateCount}");
-        GUI.Label(new Rect(20f, 304f, 430f, 22f), $"GC Delta  G0:{gc0Delta}  G1:{gc1Delta}  G2:{gc2Delta}  Mem:{managedMemoryMb:0.0} MB");
-        GUI.Label(new Rect(20f, 326f, 430f, 22f), "Pattern Keys: 1=Naive, 2=ObjectPool, C=Cycle");
+        GUI.Label(new Rect(20f, 216f, 430f, 22f), $"Background Churn: {(enableBackgroundChurnMode ? "On" : "Off")}");
+        GUI.Label(new Rect(20f, 238f, 430f, 22f), $"Ops/s  Spawn: {spawnOpsPerSecond:0.0}  Despawn: {despawnOpsPerSecond:0.0}");
+        GUI.Label(new Rect(20f, 260f, 430f, 22f), $"Instantiate: {instantiateCount}  Destroy: {destroyCount}");
+        GUI.Label(new Rect(20f, 282f, 430f, 22f), $"Pool Activate: {poolActivateCount}  Deactivate: {poolDeactivateCount}");
+        GUI.Label(new Rect(20f, 304f, 430f, 22f), $"Pool Reuse: {poolReuseActivateCount} ({PoolReusePercent():0.0}%)  Fresh: {poolFreshActivateCount}");
+        GUI.Label(new Rect(20f, 326f, 430f, 22f), $"GC Delta  G0:{gc0Delta}  G1:{gc1Delta}  G2:{gc2Delta}  Mem:{managedMemoryMb:0.0} MB");
+        GUI.Label(new Rect(20f, 348f, 430f, 22f), "Pattern Keys: 1=Naive, 2=ObjectPool, C=Cycle, B=Churn");
 
-        if (GUI.Button(new Rect(20f, 354f, 72f, 22f), isRunning ? "Stop" : "Start"))
+        if (GUI.Button(new Rect(20f, 376f, 72f, 22f), isRunning ? "Stop" : "Start"))
         {
             ToggleSimulation();
         }
 
-        if (GUI.Button(new Rect(98f, 354f, 36f, 22f), "<"))
+        if (GUI.Button(new Rect(98f, 376f, 36f, 22f), "<"))
         {
             PreviousPreset();
         }
 
-        if (GUI.Button(new Rect(138f, 354f, 36f, 22f), ">"))
+        if (GUI.Button(new Rect(138f, 376f, 36f, 22f), ">"))
         {
             NextPreset();
         }
 
-        if (GUI.Button(new Rect(180f, 354f, 84f, 22f), "Apply"))
+        if (GUI.Button(new Rect(180f, 376f, 84f, 22f), "Apply"))
         {
             ApplySelectedPreset();
         }
 
-        if (GUI.Button(new Rect(270f, 354f, 80f, 22f), "Pattern"))
+        if (GUI.Button(new Rect(270f, 376f, 80f, 22f), "Pattern"))
         {
             NextPattern();
         }
 
-        if (GUI.Button(new Rect(20f, 382f, 120f, 22f), enableAutoCycleMode ? "Cycle: On" : "Cycle: Off"))
+        if (GUI.Button(new Rect(20f, 404f, 120f, 22f), enableAutoCycleMode ? "Cycle: On" : "Cycle: Off"))
         {
             ToggleCycleMode();
+        }
+
+        if (GUI.Button(new Rect(148f, 404f, 130f, 22f), enableBackgroundChurnMode ? "Churn: On" : "Churn: Off"))
+        {
+            ToggleBackgroundChurnMode();
         }
     }
 

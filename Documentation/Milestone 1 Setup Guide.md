@@ -22,6 +22,7 @@ Note: `ObjectPoolSimulationArchitecture` is currently implemented in the same fi
 - Keyboard shortcuts: `Space` toggles run, `[` and `]` change preset.
 - Pattern switching: key `1` selects Naive, key `2` selects Object Pool, or use the `Pattern` button.
 - Cycle stress mode: key `C` toggles Cycle mode, or use the `Cycle` button in the HUD.
+- Background churn mode: key `B` toggles Churn mode, or use the `Churn` button in the HUD.
 
 ## Cycle Stress Mode (for Pooling Comparison)
 1. In `NaiveSimulationManager`, enable `Cycle Stress Mode`.
@@ -33,6 +34,14 @@ Note: `ObjectPoolSimulationArchitecture` is currently implemented in the same fi
 1. Press Start:
 - Simulation now starts at 0, ramps to preset cap, holds, ramps to 0, and repeats.
 - If you change preset while running, the cycle restarts immediately with the new target.
+
+## Background Churn Mode (around target)
+1. Turn on `Churn` mode (and keep `Cycle` mode off).
+1. Set your target preset count.
+1. Tune:
+- `Churn Rate Per Second`: churn operation frequency.
+- `Churn Band Percent`: how far count can drift above/below target.
+1. In this mode, entities continuously spawn/despawn while count stays near target.
 
 ## What to Verify
 1. Entities spawn to the selected preset count.
@@ -59,3 +68,7 @@ Note: `ObjectPoolSimulationArchitecture` is currently implemented in the same fi
 1. `Mem`: managed memory estimate in MB.
 
 When comparing patterns, use equal cycle settings and prioritize lower spike frame times and lower GC deltas over raw average FPS.
+
+## Metrics Reset Behavior
+1. Metrics reset automatically when pattern changes.
+1. Metrics reset automatically when preset/count target changes (including Apply/Next/Previous preset actions).
